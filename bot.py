@@ -16,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -31,6 +32,8 @@ ADMIN_ID = 1012040843
 DB_PATH = "bot.db"
 MAX_QUANTITY = 20
 TZ = pytz.timezone("Asia/Yekaterinburg")
+
+MENU_BUTTONS = {"↩️ Отменить", "📊 Статистика", "🛠 Админка"}
 
 router = Router()
 
@@ -395,6 +398,19 @@ def get_all_category_names() -> list[str]:
 # ================================================================ #
 #  КЛАВИАТУРЫ
 # ================================================================ #
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура внизу экрана."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(text="↩️ Отменить"),
+            KeyboardButton(text="📊 Статистика"),
+            KeyboardButton(text="🛠 Админка"),
+        ]],
+        resize_keyboard=True,
+        persistent=True,
+    )
+
+
 def quantity_keyboard(product_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for n in range(1, 6):
@@ -882,7 +898,7 @@ async def record_mix_cb(call: CallbackQuery, product: dict, qty: int):
 
 
 # ================================================================ #
-#  КОМАНДЫ
+#  КОМАНДЫ И КНОПКИ МЕНЮ
 # ================================================================ #
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -891,10 +907,8 @@ async def cmd_start(message: Message):
         "Пиши замесы просто: <code>фм</code>, <code>фм 3</code>, "
         "<code>прот 75 2</code>.\n"
         "Если продукт новый — бот спросит название и эмодзи.\n\n"
-        "Команды:\n"
-        "/undo — отменить последний замес\n"
-        "/stats — статистика\n"
-        "/admin — админ-панель")
+        "Кнопки внизу — для быстрого доступа.",
+        reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("undo"))
@@ -915,10 +929,32 @@ async def cmd_admin(message: Message):
     await message.answer("🛠 Админ-панель:", reply_markup=admin_main_keyboard())
 
 
+@router.message(F.text == "↩️ Отменить")
+async def btn_undo(message: Message):
+    await start_undo(message.from_user.id, message)
+
+
+@router.message(F.text == "📊 Статистика")
+async def btn_stats(message: Message):
+    await message.answer("Выбери период:", reply_markup=stats_period_keyboard())
+
+
+@router.message(F.text == "🛠 Админка")
+async def btn_admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Нет доступа.")
+        return
+    await message.answer("🛠 Админ-панель:", reply_markup=admin_main_keyboard())
+
+
 # ================================================================ #
 #  ВВОД ТЕКСТА
 # ================================================================ #
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(
+    F.text
+    & ~F.text.startswith("/")
+    & ~F.text.in_(MENU_BUTTONS)
+)
 async def handle_text(message: Message, state: FSMContext):
     current = await state.get_state()
     if current == NewProduct.waiting_name.state:
@@ -962,14 +998,12 @@ async def handle_mix_text(message: Message, state: FSMContext):
             f"🤔 Не знаю продукт «{name_part}».\n"
             f"Напиши полное название (сохранится для будущего):")
         return
-    # продукт найден
     if qty > MAX_QUANTITY:
         await state.update_data(product_id=product["id"], big_qty=qty)
         await message.answer(
             f"⚠️ {qty} замесов за раз — это много. Точно?",
             reply_markup=confirm_big_quantity_keyboard(product["id"], qty))
         return
-    # если числа в тексте не было — спрашиваем кнопками
     if qty == 1 and not re.search(r"\s+\d{1,3}$", raw):
         await message.answer(
             f"{product['emoji']} {product['canonical_name']} — сколько замесов?",
@@ -1396,7 +1430,6 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 
 async def job_ask_empty(bot: Bot, hour_flag: str):
-    """12:00 / 16:00 — если замесов нет, спросить."""
     flags = await get_day_flags(ADMIN_ID)
     if flags.get(hour_flag):
         return
@@ -1410,7 +1443,6 @@ async def job_ask_empty(bot: Bot, hour_flag: str):
 
 
 async def job_daily_report(bot: Bot):
-    """16:45 — вечерняя сводка с кнопками."""
     flags = await get_day_flags(ADMIN_ID)
     if flags.get("report_sent"):
         return
@@ -1426,7 +1458,6 @@ async def job_daily_report(bot: Bot):
 
 
 async def job_check_reminders(bot: Bot):
-    """Раз в минуту — отправка отложенных сводок."""
     due = await get_due_reminders()
     for r in due:
         text = await stats_day(r["user_id"])

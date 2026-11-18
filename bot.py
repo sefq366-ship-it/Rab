@@ -53,7 +53,8 @@ async def init_db() -> None:
         CREATE TABLE IF NOT EXISTS product_aliases (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             product_id INTEGER NOT NULL REFERENCES products(id),
-            alias      TEXT UNIQUE NOT NULL
+            alias      TEXT NOT NULL,
+            UNIQUE(alias, product_id)
         );
         CREATE TABLE IF NOT EXISTS equipment (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,17 +96,18 @@ async def init_db() -> None:
 
 
 # --- Продукты ---
-async def get_product_by_alias(alias: str) -> dict | None:
+async def get_products_by_alias(alias: str) -> list[dict]:
+    """Все продукты, у которых есть такой синоним (может быть >1)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("""
-            SELECT p.id, p.canonical_name, p.emoji
+            SELECT DISTINCT p.id, p.canonical_name, p.emoji
             FROM products p
             JOIN product_aliases a ON a.product_id = p.id
             WHERE LOWER(a.alias) = LOWER(?)
+            ORDER BY p.canonical_name
         """, (alias.strip(),))
-        row = await cur.fetchone()
-        return dict(row) if row else None
+        return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_all_aliases() -> list[dict]:
@@ -135,6 +137,7 @@ async def create_product(canonical_name: str, emoji: str = "📦") -> int:
 
 
 async def add_alias(product_id: int, alias: str) -> None:
+    """Добавляет синоним продукту. Дубликат пары (alias, product) игнорируется."""
     async with aiosqlite.connect(DB_PATH) as db:
         try:
             await db.execute(
@@ -633,6 +636,18 @@ def brand_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def alias_choice_keyboard(products: list[dict], alias: str) -> InlineKeyboardMarkup:
+    """Если сокращение уже занято — выбор: это тот же продукт или новый."""
+    kb = InlineKeyboardBuilder()
+    for p in products:
+        kb.button(text=f"Это {p['emoji']} {p['canonical_name']}",
+                  callback_data=f"alias_use:{p['id']}")
+    kb.button(text="➕ Нет, это другой продукт",
+              callback_data="alias_new")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def daily_report_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Отправить сейчас", callback_data="report_now")
@@ -823,7 +838,6 @@ async def _active_days(user_id: int) -> int:
 
 
 async def _day_details(user_id: int, d: str) -> list[dict]:
-    """Детализация за день: каждая запись с оборудованием и брендом."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("""
@@ -848,15 +862,7 @@ async def stats_day(user_id: int) -> str:
         return (f"📅 <b>{human_date(today)}</b> ({WEEKDAYS_RU[today.weekday()]})\n\n"
                 f"Пока нет ни одного замеса за сегодня.")
     total = sum(r["quantity"] for r in details)
-    first = None
-    last = None
-    for r in details:
-        t = str(r["created_at"])
-        if " " in t:
-            hm = t.split(" ")[1][:5]
-            if first is None:
-                first = hm
-            last = hm
+    first, last = await _day_times(user_id, d_str)
     lines = [f"📅 <b>{human_date(today)}</b> ({WEEKDAYS_RU[today.weekday()]})", ""]
     for r in details:
         q = f" ×{r['quantity']}" if r["quantity"] > 1 else ""
@@ -1002,6 +1008,10 @@ class MixFlow(StatesGroup):
     waiting_new_brand = State()
 
 
+class AliasConflict(StatesGroup):
+    waiting_choice = State()
+
+
 class AdminAddProduct(StatesGroup):
     waiting_name = State()
     waiting_emoji = State()
@@ -1036,25 +1046,27 @@ def parse_quantity(text: str) -> tuple[str, int]:
     return text, 1
 
 
-async def resolve_product(text: str) -> dict | None:
-    exact = await get_product_by_alias(text)
+async def resolve_products(text: str) -> list[dict]:
+    """Возвращает список продуктов, подходящих под сокращение (0, 1 или >1)."""
+    exact = await get_products_by_alias(text)
     if exact:
         return exact
     try:
         from rapidfuzz import process, fuzz
     except ImportError:
-        return None
+        return []
     aliases = await get_all_aliases()
     if not aliases:
-        return None
-    alias_map = {a["alias"]: a for a in aliases}
+        return []
+    alias_map: dict[str, dict] = {}
+    for a in aliases:
+        alias_map.setdefault(a["alias"].lower(), a)
     match, score, _ = process.extractOne(
         text.lower(), list(alias_map.keys()), scorer=fuzz.ratio)
     if match and score >= 85:
-        a = alias_map[match]
-        return {"id": a["id"], "canonical_name": a["canonical_name"],
-                "emoji": a["emoji"]}
-    return None
+        # все продукты с этим синонимом
+        return await get_products_by_alias(match)
+    return []
 
 
 # ================================================================ #
@@ -1201,7 +1213,6 @@ async def btn_admin(message: Message):
 async def handle_text(message: Message, state: FSMContext):
     current = await state.get_state()
 
-    # --- продукт ---
     if current == NewProduct.waiting_name.state:
         await new_product_save_name(message, state)
         return
@@ -1212,7 +1223,6 @@ async def handle_text(message: Message, state: FSMContext):
         await qty_manual_input(message, state)
         return
 
-    # --- цепочка замеса ---
     if current == MixFlow.waiting_new_equipment.state:
         await mix_new_equipment(message, state)
         return
@@ -1220,7 +1230,6 @@ async def handle_text(message: Message, state: FSMContext):
         await mix_new_brand(message, state)
         return
 
-    # --- админ: продукты ---
     if current == AdminAddProduct.waiting_name.state:
         await admin_add_name(message, state)
         return
@@ -1240,7 +1249,6 @@ async def handle_text(message: Message, state: FSMContext):
         await admin_edit_alias(message, state)
         return
 
-    # --- админ: оборудование / бренды ---
     if current == AdminAddEquipment.waiting_name.state:
         await admin_eq_save(message, state)
         return
@@ -1254,9 +1262,9 @@ async def handle_text(message: Message, state: FSMContext):
 async def handle_mix_text(message: Message, state: FSMContext):
     raw = message.text.strip()
     name_part, qty = parse_quantity(raw)
-    product = await resolve_product(name_part)
+    products = await resolve_products(name_part)
 
-    if not product:
+    if not products:
         await state.update_data(alias=name_part, pending_qty=qty)
         await state.set_state(NewProduct.waiting_name)
         await message.answer(
@@ -1264,6 +1272,17 @@ async def handle_mix_text(message: Message, state: FSMContext):
             f"Напиши полное название (сохранится для будущего):")
         return
 
+    if len(products) > 1:
+        # сокращение занято несколькими продуктами — выбор
+        await state.update_data(pending_qty=qty, pending_alias=name_part)
+        await state.set_state(AliasConflict.waiting_choice)
+        await message.answer(
+            f"Сокращение «{name_part}» подходит к нескольким продуктам.\n"
+            f"Какой выбрать?",
+            reply_markup=alias_choice_keyboard(products, name_part))
+        return
+
+    product = products[0]
     if qty > MAX_QUANTITY:
         await state.update_data(product_id=product["id"], big_qty=qty)
         await message.answer(
@@ -1281,13 +1300,54 @@ async def handle_mix_text(message: Message, state: FSMContext):
     await ask_equipment(message, state, product, qty)
 
 
+@router.callback_query(F.data.startswith("alias_use:"))
+async def cb_alias_use(call: CallbackQuery, state: FSMContext):
+    pid = int(call.data.split(":")[1])
+    product = await get_product(pid)
+    data = await state.get_data()
+    qty = data.get("pending_qty", 1)
+    await state.clear()
+    await call.message.delete()
+    if qty > MAX_QUANTITY:
+        await state.update_data(product_id=pid, big_qty=qty)
+        await call.message.answer(
+            f"⚠️ {qty} замесов за раз — это много. Точно?",
+            reply_markup=confirm_big_quantity_keyboard(pid, qty))
+        await call.answer()
+        return
+    if qty == 1 and not re.search(r"\s+\d{1,3}$", call.message.text or ""):
+        # не знаем, было ли число — считаем, что нет
+        await state.update_data(pending_product=product)
+        await call.message.answer(
+            f"{product['emoji']} {product['canonical_name']} — сколько замесов?",
+            reply_markup=quantity_keyboard(pid))
+        await call.answer()
+        return
+    await ask_equipment(call.message, state, product, qty)
+    await call.answer()
+
+
+@router.callback_query(F.data == "alias_new")
+async def cb_alias_new(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    alias = data.get("pending_alias", "")
+    qty = data.get("pending_qty", 1)
+    await state.update_data(alias=alias, pending_qty=qty)
+    await state.set_state(NewProduct.waiting_name)
+    await call.message.edit_text(
+        f"Хорошо, это новый продукт для сокращения «{alias}».\n"
+        f"Напиши полное название:")
+    await call.answer()
+
+
 async def new_product_save_name(message: Message, state: FSMContext):
     data = await state.get_data()
     alias = data.get("alias", "")
     pending_qty = data.get("pending_qty", 1)
     canonical = message.text.strip()
     pid = await create_product(canonical)
-    await add_alias(pid, alias)
+    if alias:
+        await add_alias(pid, alias)
     await add_alias(pid, canonical.lower())
     await state.update_data(product_id=pid, canonical=canonical, pending_qty=pending_qty)
     await state.set_state(NewProduct.waiting_emoji)
@@ -1328,12 +1388,7 @@ async def qty_manual_input(message: Message, state: FSMContext):
             reply_markup=confirm_big_quantity_keyboard(data["qty_product_id"], n))
         return
     product = await get_product(data["qty_product_id"])
-    await qty_done(message, state, product, n)
-
-
-async def qty_done(message: Message, state: FSMContext, product: dict, qty: int):
-    """После выбора количества — спрашиваем оборудование."""
-    await ask_equipment(message, state, product, qty)
+    await ask_equipment(message, state, product, n)
 
 
 # ================================================================ #
@@ -1589,7 +1644,6 @@ async def cb_admin_stats(call: CallbackQuery):
     await call.answer()
 
 
-# --- Продукты ---
 @router.callback_query(F.data == "admin_products")
 async def cb_admin_products(call: CallbackQuery):
     await call.message.edit_text("📦 Управление продуктами:",
@@ -1643,7 +1697,9 @@ async def cb_admin_palias(call: CallbackQuery, state: FSMContext):
     pid = int(call.data.split(":")[1])
     await state.update_data(edit_pid=pid)
     await state.set_state(AdminEditProduct.waiting_alias)
-    await call.message.edit_text("Пришли новый синоним:")
+    await call.message.edit_text(
+        "Пришли сокращение (синоним).\n"
+        "Оно добавится к этому продукту — оборудование и бренд не нужны.")
     await call.answer()
 
 
@@ -1668,11 +1724,63 @@ async def admin_edit_emoji(message: Message, state: FSMContext):
 
 
 async def admin_edit_alias(message: Message, state: FSMContext):
+    """
+    Добавление сокращения через админку.
+    Проверяем: не занято ли оно другим продуктом.
+    Если занято — спрашиваем, добавить как новое или это тот же продукт.
+    """
     data = await state.get_data()
-    await add_alias(data["edit_pid"], message.text.strip())
+    pid = data["edit_pid"]
+    alias = message.text.strip().lower()
+
+    existing = await get_products_by_alias(alias)
+    # если это тот же продукт — просто добавим (игнорируем дубликат)
+    same = [p for p in existing if p["id"] == pid]
+    others = [p for p in existing if p["id"] != pid]
+
+    if others and not same:
+        # сокращение занято другим продуктом
+        await state.update_data(pending_alias=alias, edit_pid=pid)
+        await state.set_state(AliasConflict.waiting_choice)
+        await message.answer(
+            f"Сокращение «{alias}» уже используется:\n\n"
+            + "\n".join(f"{p['emoji']} {p['canonical_name']}" for p in others)
+            + "\n\nЭто тот же продукт или другой?",
+            reply_markup=alias_choice_keyboard(others, alias))
+        return
+
+    await add_alias(pid, alias)
     await state.clear()
-    await message.answer("✅ Синоним добавлен.",
+    await message.answer(f"✅ Сокращение «{alias}» добавлено.",
                          reply_markup=admin_products_keyboard())
+
+
+@router.callback_query(F.data.startswith("alias_admin_use:"))
+async def cb_alias_admin_use(call: CallbackQuery, state: FSMContext):
+    """Пользователь сказал: это тот же продукт, что уже есть."""
+    other_pid = int(call.data.split(":")[1])
+    data = await state.get_data()
+    current_pid = data["edit_pid"]
+    alias = data["pending_alias"]
+    # добавляем сокращение текущему продукту тоже
+    await add_alias(current_pid, alias)
+    await state.clear()
+    await call.message.edit_text(
+        f"✅ Сокращение «{alias}» добавлено (теперь доступно у нескольких продуктов).")
+    await call.answer()
+
+
+@router.callback_query(F.data == "alias_admin_new")
+async def cb_alias_admin_new(call: CallbackQuery, state: FSMContext):
+    """Пользователь сказал: это другой продукт — создаём новый."""
+    data = await state.get_data()
+    alias = data.get("pending_alias", "")
+    await state.update_data(alias=alias, pending_qty=1)
+    await state.set_state(NewProduct.waiting_name)
+    await call.message.edit_text(
+        f"Хорошо, создаём новый продукт для сокращения «{alias}».\n"
+        f"Напиши полное название:")
+    await call.answer()
 
 
 @router.callback_query(F.data == "admin_product_add")

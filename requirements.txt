@@ -1,6 +1,0 @@
-aiogram>=3.0
-aiosqlite
-apscheduler
-pytz
-emoji-index>=0.2.0
-rapidfuzz>=3.0

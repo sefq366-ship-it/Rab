@@ -55,13 +55,25 @@ async def init_db() -> None:
             product_id INTEGER NOT NULL REFERENCES products(id),
             alias      TEXT UNIQUE NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS mixes (
+        CREATE TABLE IF NOT EXISTS equipment (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
-            product_id INTEGER NOT NULL REFERENCES products(id),
-            quantity   INTEGER NOT NULL DEFAULT 1,
-            date       TEXT NOT NULL,
+            name       TEXT UNIQUE NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS brands (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS mixes (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER NOT NULL,
+            product_id   INTEGER NOT NULL REFERENCES products(id),
+            quantity     INTEGER NOT NULL DEFAULT 1,
+            equipment_id INTEGER REFERENCES equipment(id),
+            brand_id     INTEGER REFERENCES brands(id),
+            date         TEXT NOT NULL,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS reminders (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +94,7 @@ async def init_db() -> None:
         await db.commit()
 
 
+# --- Продукты ---
 async def get_product_by_alias(alias: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -166,12 +179,74 @@ async def set_product_name(pid: int, name: str) -> None:
         await db.commit()
 
 
-async def add_mix(user_id: int, product_id: int, quantity: int) -> int:
+# --- Оборудование ---
+async def get_all_equipment() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, name FROM equipment ORDER BY name")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def add_equipment(name: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO equipment (name) VALUES (?)", (name.strip(),))
+        await db.commit()
+        if cur.lastrowid:
+            return cur.lastrowid
+        cur = await db.execute(
+            "SELECT id FROM equipment WHERE name = ?", (name.strip(),))
+        row = await cur.fetchone()
+        return row[0]
+
+
+async def get_equipment(eid: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, name FROM equipment WHERE id = ?", (eid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+# --- Бренды ---
+async def get_all_brands() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, name FROM brands ORDER BY name")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def add_brand(name: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO brands (name) VALUES (?)", (name.strip(),))
+        await db.commit()
+        if cur.lastrowid:
+            return cur.lastrowid
+        cur = await db.execute(
+            "SELECT id FROM brands WHERE name = ?", (name.strip(),))
+        row = await cur.fetchone()
+        return row[0]
+
+
+async def get_brand(bid: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, name FROM brands WHERE id = ?", (bid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+# --- Замесы ---
+async def add_mix(user_id: int, product_id: int, quantity: int,
+                  equipment_id: int | None = None,
+                  brand_id: int | None = None) -> int:
     today = str(date.today())
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO mixes (user_id, product_id, quantity, date) VALUES (?, ?, ?, ?)",
-            (user_id, product_id, quantity, today))
+            "INSERT INTO mixes (user_id, product_id, quantity, equipment_id, brand_id, date) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, product_id, quantity, equipment_id, brand_id, today))
         await db.commit()
         return cur.lastrowid
 
@@ -180,8 +255,13 @@ async def get_last_mix(user_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("""
-            SELECT m.id, m.quantity, m.created_at, p.canonical_name, p.emoji
-            FROM mixes m JOIN products p ON p.id = m.product_id
+            SELECT m.id, m.quantity, m.created_at,
+                   p.canonical_name, p.emoji,
+                   e.name AS equipment_name, b.name AS brand_name
+            FROM mixes m
+            JOIN products p ON p.id = m.product_id
+            LEFT JOIN equipment e ON e.id = m.equipment_id
+            LEFT JOIN brands b ON b.id = m.brand_id
             WHERE m.user_id = ? ORDER BY m.id DESC LIMIT 1
         """, (user_id,))
         row = await cur.fetchone()
@@ -213,6 +293,7 @@ async def count_today(user_id: int) -> int:
         return row[0] if row else 0
 
 
+# --- Напоминания ---
 async def create_reminder(user_id: int, minutes: int) -> None:
     send_at = datetime.now() + timedelta(minutes=minutes)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -241,6 +322,7 @@ async def mark_reminder_sent(rid: int) -> None:
         await db.commit()
 
 
+# --- Флаги дня ---
 async def get_day_flags(user_id: int) -> dict:
     today = str(date.today())
     async with aiosqlite.connect(DB_PATH) as db:
@@ -399,7 +481,6 @@ def get_all_category_names() -> list[str]:
 #  КЛАВИАТУРЫ
 # ================================================================ #
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура внизу экрана."""
     return ReplyKeyboardMarkup(
         keyboard=[[
             KeyboardButton(text="↩️ Отменить"),
@@ -524,6 +605,34 @@ def after_mix_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def equipment_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for it in items:
+        kb.button(text=it["name"], callback_data=f"eq_sel:{it['id']}")
+    kb.button(text="➕ Добавить оборудование", callback_data="eq_add")
+    kb.button(text="❌ Отмена", callback_data="cancel")
+    rows = [2] * (len(items) // 2)
+    if len(items) % 2:
+        rows.append(1)
+    rows += [1, 1]
+    kb.adjust(*rows)
+    return kb.as_markup()
+
+
+def brand_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for it in items:
+        kb.button(text=it["name"], callback_data=f"br_sel:{it['id']}")
+    kb.button(text="➕ Добавить бренд", callback_data="br_add")
+    kb.button(text="❌ Отмена", callback_data="cancel")
+    rows = [2] * (len(items) // 2)
+    if len(items) % 2:
+        rows.append(1)
+    rows += [1, 1]
+    kb.adjust(*rows)
+    return kb.as_markup()
+
+
 def daily_report_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Отправить сейчас", callback_data="report_now")
@@ -544,9 +653,11 @@ def empty_day_keyboard() -> InlineKeyboardMarkup:
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Продукты", callback_data="admin_products")
+    kb.button(text="🔧 Оборудование", callback_data="admin_equipment")
+    kb.button(text="🏷 Бренды", callback_data="admin_brands")
     kb.button(text="📊 Статистика", callback_data="admin_stats")
     kb.button(text="🔙 Закрыть", callback_data="admin_close")
-    kb.adjust(2, 1)
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -585,6 +696,26 @@ def admin_add_steps_keyboard(step: int) -> InlineKeyboardMarkup:
         kb.button(text="🔙 Назад", callback_data=f"admin_add_back:{step-1}")
     kb.button(text="❌ Отмена", callback_data="admin_products")
     kb.adjust(2 if step > 1 else 1)
+    return kb.as_markup()
+
+
+def admin_equipment_list_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for it in items:
+        kb.button(text=it["name"], callback_data=f"admin_eq_edit:{it['id']}")
+    kb.button(text="➕ Добавить", callback_data="admin_eq_add")
+    kb.button(text="🔙 Назад", callback_data="admin_main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_brand_list_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for it in items:
+        kb.button(text=it["name"], callback_data=f"admin_br_edit:{it['id']}")
+    kb.button(text="➕ Добавить", callback_data="admin_br_add")
+    kb.button(text="🔙 Назад", callback_data="admin_main")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -691,18 +822,52 @@ async def _active_days(user_id: int) -> int:
         return row[0] if row else 0
 
 
+async def _day_details(user_id: int, d: str) -> list[dict]:
+    """Детализация за день: каждая запись с оборудованием и брендом."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT p.canonical_name, p.emoji, m.quantity,
+                   e.name AS equipment_name, b.name AS brand_name,
+                   m.created_at
+            FROM mixes m
+            JOIN products p ON p.id = m.product_id
+            LEFT JOIN equipment e ON e.id = m.equipment_id
+            LEFT JOIN brands b ON b.id = m.brand_id
+            WHERE m.user_id = ? AND m.date = ?
+            ORDER BY m.id
+        """, (user_id, d))
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def stats_day(user_id: int) -> str:
     today = date.today()
     d_str = str(today)
-    by_product = await _by_product(user_id, "m.date = ?", (d_str,))
-    if not by_product:
+    details = await _day_details(user_id, d_str)
+    if not details:
         return (f"📅 <b>{human_date(today)}</b> ({WEEKDAYS_RU[today.weekday()]})\n\n"
                 f"Пока нет ни одного замеса за сегодня.")
-    total = sum(r["total"] for r in by_product)
-    first, last = await _day_times(user_id, d_str)
+    total = sum(r["quantity"] for r in details)
+    first = None
+    last = None
+    for r in details:
+        t = str(r["created_at"])
+        if " " in t:
+            hm = t.split(" ")[1][:5]
+            if first is None:
+                first = hm
+            last = hm
     lines = [f"📅 <b>{human_date(today)}</b> ({WEEKDAYS_RU[today.weekday()]})", ""]
-    for r in by_product:
-        lines.append(f"{r['emoji']} {r['canonical_name']} — <b>{r['total']}</b>")
+    for r in details:
+        q = f" ×{r['quantity']}" if r["quantity"] > 1 else ""
+        lines.append(f"{r['emoji']} {r['canonical_name']}{q}")
+        parts = []
+        if r.get("equipment_name"):
+            parts.append(f"🔧 {r['equipment_name']}")
+        if r.get("brand_name"):
+            parts.append(f"🏷 {r['brand_name']}")
+        if parts:
+            lines.append("   " + " | ".join(parts))
     lines += ["", "───────────────", f"📦 Всего: <b>{format_mixes(total)}</b>"]
     if first:
         lines.append(f"⏱ Первый: {first}")
@@ -830,6 +995,13 @@ class QtyInput(StatesGroup):
     waiting_qty = State()
 
 
+class MixFlow(StatesGroup):
+    waiting_equipment = State()
+    waiting_brand = State()
+    waiting_new_equipment = State()
+    waiting_new_brand = State()
+
+
 class AdminAddProduct(StatesGroup):
     waiting_name = State()
     waiting_emoji = State()
@@ -840,6 +1012,14 @@ class AdminEditProduct(StatesGroup):
     waiting_name = State()
     waiting_emoji = State()
     waiting_alias = State()
+
+
+class AdminAddEquipment(StatesGroup):
+    waiting_name = State()
+
+
+class AdminAddBrand(StatesGroup):
+    waiting_name = State()
 
 
 # ================================================================ #
@@ -877,24 +1057,86 @@ async def resolve_product(text: str) -> dict | None:
     return None
 
 
-async def record_mix(message: Message, product: dict, qty: int):
-    await add_mix(message.from_user.id, product["id"], qty)
+# ================================================================ #
+#  ЦЕПОЧКА ВВОДА: ПРОДУКТ → КОЛИЧЕСТВО → ОБОРУДОВАНИЕ → БРЕНД
+# ================================================================ #
+async def ask_equipment(message: Message, state: FSMContext,
+                        product: dict, qty: int):
+    equipment = await get_all_equipment()
+    await state.update_data(flow_product=product, flow_qty=qty, flow_equipment=None)
+    if len(equipment) == 0:
+        await state.set_state(MixFlow.waiting_new_equipment)
+        await message.answer(
+            "Сначала добавь оборудование (его ещё нет).\n"
+            "Напиши название оборудования:")
+        return
+    if len(equipment) == 1:
+        await state.update_data(flow_equipment=equipment[0])
+        await ask_brand(message, state)
+        return
+    await state.set_state(MixFlow.waiting_equipment)
+    await message.answer("Выбери оборудование:",
+                         reply_markup=equipment_keyboard(equipment))
+
+
+async def ask_brand(message: Message, state: FSMContext):
+    brands = await get_all_brands()
+    await state.update_data(flow_brand=None)
+    if len(brands) == 0:
+        await state.set_state(MixFlow.waiting_new_brand)
+        await message.answer(
+            "Сначала добавь бренд (их ещё нет).\n"
+            "Напиши название бренда:")
+        return
+    if len(brands) == 1:
+        await state.update_data(flow_brand=brands[0])
+        await finish_mix(message, state)
+        return
+    await state.set_state(MixFlow.waiting_brand)
+    await message.answer("Выбери бренд:", reply_markup=brand_keyboard(brands))
+
+
+async def finish_mix(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product = data["flow_product"]
+    qty = data["flow_qty"]
+    equipment = data.get("flow_equipment")
+    brand = data.get("flow_brand")
+
+    await add_mix(
+        message.from_user.id, product["id"], qty,
+        equipment["id"] if equipment else None,
+        brand["id"] if brand else None,
+    )
     total_today = await count_today(message.from_user.id)
     qty_text = f"×{qty}" if qty > 1 else ""
-    await message.answer(
-        f"✅ {product['emoji']} {product['canonical_name']} {qty_text}\n"
-        f"Сегодня: {total_today}",
-        reply_markup=after_mix_keyboard())
+    lines = [f"✅ {product['emoji']} {product['canonical_name']} {qty_text}"]
+    parts = []
+    if equipment:
+        parts.append(f"🔧 {equipment['name']}")
+    if brand:
+        parts.append(f"🏷 {brand['name']}")
+    if parts:
+        lines.append(" | ".join(parts))
+    lines.append(f"Сегодня: {total_today}")
+    await state.clear()
+    await message.answer("\n".join(lines), reply_markup=after_mix_keyboard())
 
 
-async def record_mix_cb(call: CallbackQuery, product: dict, qty: int):
-    await add_mix(call.from_user.id, product["id"], qty)
-    total_today = await count_today(call.from_user.id)
-    qty_text = f"×{qty}" if qty > 1 else ""
-    await call.message.answer(
-        f"✅ {product['emoji']} {product['canonical_name']} {qty_text}\n"
-        f"Сегодня: {total_today}",
-        reply_markup=after_mix_keyboard())
+async def mix_new_equipment(message: Message, state: FSMContext):
+    name = message.text.strip()
+    eid = await add_equipment(name)
+    eq = await get_equipment(eid)
+    await state.update_data(flow_equipment=eq)
+    await ask_brand(message, state)
+
+
+async def mix_new_brand(message: Message, state: FSMContext):
+    name = message.text.strip()
+    bid = await add_brand(name)
+    br = await get_brand(bid)
+    await state.update_data(flow_brand=br)
+    await finish_mix(message, state)
 
 
 # ================================================================ #
@@ -906,7 +1148,8 @@ async def cmd_start(message: Message):
         "👋 Привет!\n\n"
         "Пиши замесы просто: <code>фм</code>, <code>фм 3</code>, "
         "<code>прот 75 2</code>.\n"
-        "Если продукт новый — бот спросит название и эмодзи.\n\n"
+        "Если продукт новый — бот спросит название и эмодзи.\n"
+        "Потом выберешь оборудование и бренд кнопками.\n\n"
         "Кнопки внизу — для быстрого доступа.",
         reply_markup=main_menu_keyboard())
 
@@ -957,6 +1200,8 @@ async def btn_admin(message: Message):
 )
 async def handle_text(message: Message, state: FSMContext):
     current = await state.get_state()
+
+    # --- продукт ---
     if current == NewProduct.waiting_name.state:
         await new_product_save_name(message, state)
         return
@@ -966,6 +1211,16 @@ async def handle_text(message: Message, state: FSMContext):
     if current == QtyInput.waiting_qty.state:
         await qty_manual_input(message, state)
         return
+
+    # --- цепочка замеса ---
+    if current == MixFlow.waiting_new_equipment.state:
+        await mix_new_equipment(message, state)
+        return
+    if current == MixFlow.waiting_new_brand.state:
+        await mix_new_brand(message, state)
+        return
+
+    # --- админ: продукты ---
     if current == AdminAddProduct.waiting_name.state:
         await admin_add_name(message, state)
         return
@@ -984,6 +1239,15 @@ async def handle_text(message: Message, state: FSMContext):
     if current == AdminEditProduct.waiting_alias.state:
         await admin_edit_alias(message, state)
         return
+
+    # --- админ: оборудование / бренды ---
+    if current == AdminAddEquipment.waiting_name.state:
+        await admin_eq_save(message, state)
+        return
+    if current == AdminAddBrand.waiting_name.state:
+        await admin_br_save(message, state)
+        return
+
     await handle_mix_text(message, state)
 
 
@@ -991,6 +1255,7 @@ async def handle_mix_text(message: Message, state: FSMContext):
     raw = message.text.strip()
     name_part, qty = parse_quantity(raw)
     product = await resolve_product(name_part)
+
     if not product:
         await state.update_data(alias=name_part, pending_qty=qty)
         await state.set_state(NewProduct.waiting_name)
@@ -998,18 +1263,22 @@ async def handle_mix_text(message: Message, state: FSMContext):
             f"🤔 Не знаю продукт «{name_part}».\n"
             f"Напиши полное название (сохранится для будущего):")
         return
+
     if qty > MAX_QUANTITY:
         await state.update_data(product_id=product["id"], big_qty=qty)
         await message.answer(
             f"⚠️ {qty} замесов за раз — это много. Точно?",
             reply_markup=confirm_big_quantity_keyboard(product["id"], qty))
         return
+
     if qty == 1 and not re.search(r"\s+\d{1,3}$", raw):
+        await state.update_data(pending_product=product)
         await message.answer(
             f"{product['emoji']} {product['canonical_name']} — сколько замесов?",
             reply_markup=quantity_keyboard(product["id"]))
         return
-    await record_mix(message, product, qty)
+
+    await ask_equipment(message, state, product, qty)
 
 
 async def new_product_save_name(message: Message, state: FSMContext):
@@ -1039,9 +1308,8 @@ async def new_product_save_manual_emoji(message: Message, state: FSMContext):
     pid = data["product_id"]
     pending_qty = data.get("pending_qty", 1)
     await set_emoji(pid, text)
-    await state.clear()
     product = {"id": pid, "canonical_name": data["canonical"], "emoji": text}
-    await record_mix(message, product, pending_qty)
+    await ask_equipment(message, state, product, pending_qty)
 
 
 async def qty_manual_input(message: Message, state: FSMContext):
@@ -1060,19 +1328,23 @@ async def qty_manual_input(message: Message, state: FSMContext):
             reply_markup=confirm_big_quantity_keyboard(data["qty_product_id"], n))
         return
     product = await get_product(data["qty_product_id"])
-    await state.clear()
-    await record_mix(message, product, n)
+    await qty_done(message, state, product, n)
+
+
+async def qty_done(message: Message, state: FSMContext, product: dict, qty: int):
+    """После выбора количества — спрашиваем оборудование."""
+    await ask_equipment(message, state, product, qty)
 
 
 # ================================================================ #
 #  CALLBACK: КОЛИЧЕСТВО
 # ================================================================ #
 @router.callback_query(F.data.startswith("qty:"))
-async def cb_qty(call: CallbackQuery):
+async def cb_qty(call: CallbackQuery, state: FSMContext):
     _, pid, n = call.data.split(":")
     product = await get_product(int(pid))
     await call.message.delete()
-    await record_mix_cb(call, product, int(n))
+    await ask_equipment(call.message, state, product, int(n))
     await call.answer()
 
 
@@ -1087,11 +1359,48 @@ async def cb_qty_other(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("qty_confirm:"))
-async def cb_qty_confirm(call: CallbackQuery):
+async def cb_qty_confirm(call: CallbackQuery, state: FSMContext):
     _, pid, n = call.data.split(":")
     product = await get_product(int(pid))
     await call.message.delete()
-    await record_mix_cb(call, product, int(n))
+    await ask_equipment(call.message, state, product, int(n))
+    await call.answer()
+
+
+# ================================================================ #
+#  CALLBACK: ОБОРУДОВАНИЕ И БРЕНД
+# ================================================================ #
+@router.callback_query(F.data.startswith("eq_sel:"))
+async def cb_eq_sel(call: CallbackQuery, state: FSMContext):
+    eid = int(call.data.split(":")[1])
+    eq = await get_equipment(eid)
+    await state.update_data(flow_equipment=eq)
+    await call.message.delete()
+    await ask_brand(call.message, state)
+    await call.answer()
+
+
+@router.callback_query(F.data == "eq_add")
+async def cb_eq_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(MixFlow.waiting_new_equipment)
+    await call.message.edit_text("Напиши название оборудования:")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("br_sel:"))
+async def cb_br_sel(call: CallbackQuery, state: FSMContext):
+    bid = int(call.data.split(":")[1])
+    br = await get_brand(bid)
+    await state.update_data(flow_brand=br)
+    await call.message.delete()
+    await finish_mix(call.message, state)
+    await call.answer()
+
+
+@router.callback_query(F.data == "br_add")
+async def cb_br_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(MixFlow.waiting_new_brand)
+    await call.message.edit_text("Напиши название бренда:")
     await call.answer()
 
 
@@ -1101,13 +1410,13 @@ async def cb_qty_confirm(call: CallbackQuery):
 @router.callback_query(F.data.startswith("emoji_set:"))
 async def cb_emoji_set(call: CallbackQuery, state: FSMContext):
     _, pid, emoji = call.data.split(":", 2)
-    await _set_emoji_and_finish(call, int(pid), emoji, state)
+    await _set_emoji_and_continue(call, int(pid), emoji, state)
 
 
 @router.callback_query(F.data.startswith("emoji_skip:"))
 async def cb_emoji_skip(call: CallbackQuery, state: FSMContext):
     pid = int(call.data.split(":")[1])
-    await _set_emoji_and_finish(call, pid, "📦", state)
+    await _set_emoji_and_continue(call, pid, "📦", state)
 
 
 @router.callback_query(F.data.startswith("emoji_cats:"))
@@ -1155,16 +1464,15 @@ async def cb_emoji_back(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-async def _set_emoji_and_finish(call: CallbackQuery, pid: int, emoji: str,
-                                state: FSMContext):
+async def _set_emoji_and_continue(call: CallbackQuery, pid: int, emoji: str,
+                                  state: FSMContext):
     data = await state.get_data()
     pending_qty = data.get("pending_qty", 1)
     canonical = data.get("canonical", "")
     await set_emoji(pid, emoji)
-    await state.clear()
     await call.message.delete()
     product = {"id": pid, "canonical_name": canonical, "emoji": emoji}
-    await record_mix_cb(call, product, pending_qty)
+    await ask_equipment(call.message, state, product, pending_qty)
     await call.answer()
 
 
@@ -1178,9 +1486,15 @@ async def start_undo(user_id: int, message: Message):
         return
     created = str(last["created_at"])
     time_part = created.split(" ")[1][:5] if " " in created else "—"
+    parts = []
+    if last.get("equipment_name"):
+        parts.append(f"🔧 {last['equipment_name']}")
+    if last.get("brand_name"):
+        parts.append(f"🏷 {last['brand_name']}")
+    extra = ("\n" + " | ".join(parts)) if parts else ""
     await message.answer(
         f"Последняя запись:\n"
-        f"{last['emoji']} {last['canonical_name']} — {last['quantity']} (в {time_part})\n\n"
+        f"{last['emoji']} {last['canonical_name']} — {last['quantity']} (в {time_part}){extra}\n\n"
         f"Сколько убрать?",
         reply_markup=undo_keyboard(last["quantity"]))
 
@@ -1275,6 +1589,7 @@ async def cb_admin_stats(call: CallbackQuery):
     await call.answer()
 
 
+# --- Продукты ---
 @router.callback_query(F.data == "admin_products")
 async def cb_admin_products(call: CallbackQuery):
     await call.message.edit_text("📦 Управление продуктами:",
@@ -1414,6 +1729,55 @@ async def cb_admin_add_back(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text("➕ Шаг 1/3. Введи название продукта:",
                                      reply_markup=admin_add_steps_keyboard(1))
     await call.answer()
+
+
+# --- Оборудование ---
+@router.callback_query(F.data == "admin_equipment")
+async def cb_admin_equipment(call: CallbackQuery):
+    items = await get_all_equipment()
+    text = "🔧 Оборудование:\n\n" + ("\n".join(i["name"] for i in items) or "Пусто")
+    await call.message.edit_text(text,
+                                 reply_markup=admin_equipment_list_keyboard(items))
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_eq_add")
+async def cb_admin_eq_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminAddEquipment.waiting_name)
+    await call.message.edit_text("Название оборудования:")
+    await call.answer()
+
+
+async def admin_eq_save(message: Message, state: FSMContext):
+    await add_equipment(message.text.strip())
+    await state.clear()
+    items = await get_all_equipment()
+    text = "🔧 Оборудование:\n\n" + ("\n".join(i["name"] for i in items) or "Пусто")
+    await message.answer(text, reply_markup=admin_equipment_list_keyboard(items))
+
+
+# --- Бренды ---
+@router.callback_query(F.data == "admin_brands")
+async def cb_admin_brands(call: CallbackQuery):
+    items = await get_all_brands()
+    text = "🏷 Бренды:\n\n" + ("\n".join(i["name"] for i in items) or "Пусто")
+    await call.message.edit_text(text, reply_markup=admin_brand_list_keyboard(items))
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_br_add")
+async def cb_admin_br_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminAddBrand.waiting_name)
+    await call.message.edit_text("Название бренда:")
+    await call.answer()
+
+
+async def admin_br_save(message: Message, state: FSMContext):
+    await add_brand(message.text.strip())
+    await state.clear()
+    items = await get_all_brands()
+    text = "🏷 Бренды:\n\n" + ("\n".join(i["name"] for i in items) or "Пусто")
+    await message.answer(text, reply_markup=admin_brand_list_keyboard(items))
 
 
 @router.callback_query(F.data == "cancel")
